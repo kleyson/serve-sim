@@ -4,9 +4,10 @@
  *
  * Produces, all minified and with no runtime deps on workspace packages:
  *   dist/serve-sim.js      ESM bin (node target) referenced by package.json#bin
- *   dist/serve-sim         Compiled single-file executable (bun --compile)
+ *   dist/serve-sim         Compiled executable (bun --compile)
  *   dist/middleware.js    Public subpath export "serve-sim/middleware" (ESM)
  *   dist/middleware.cjs   Thin CJS wrapper for the same
+ *   dist/serve-sim-<version>-macos-<arch>.zip  Relocatable executable bundle
  *
  * The bin and middleware bundles target `node` so users without `bun` on
  * their PATH can still run `npx serve-sim` / mount the Connect middleware.
@@ -17,7 +18,7 @@
  * via the __PREVIEW_HTML_B64__ build-time define.
  */
 import { resolve } from "path";
-import { mkdirSync, writeFileSync, rmSync, readFileSync } from "fs";
+import { chmodSync, copyFileSync, mkdirSync, writeFileSync, rmSync, readFileSync } from "fs";
 import { spawnSync } from "child_process";
 import tailwindPlugin from "bun-plugin-tailwind";
 
@@ -113,6 +114,7 @@ const pkgVersion = JSON.parse(
 const PREVIEW_DEFINE = {
   __PREVIEW_HTML_B64__: JSON.stringify(htmlB64),
   __SERVE_SIM_VERSION__: JSON.stringify(pkgVersion),
+  __SERVE_SIM_STANDALONE__: "false",
 };
 
 // ─── 3. Middleware ESM (serve-sim/middleware) ─────────────────────────────
@@ -181,6 +183,7 @@ const compile = spawnSync(
     "--outfile", resolve(distDir, "serve-sim"),
     "--define", `__PREVIEW_HTML_B64__=${JSON.stringify(htmlB64)}`,
     "--define", `__SERVE_SIM_VERSION__=${JSON.stringify(pkgVersion)}`,
+    "--define", "__SERVE_SIM_STANDALONE__=true",
     // `ws` must stay a runtime-resolved specifier so Bun substitutes its
     // native implementation — bundling the Node implementation breaks
     // upgrades (raw handshake writes never flush under Bun's node:http).
@@ -256,5 +259,65 @@ if (nativeBuild.status !== 0) {
   process.exit(nativeBuild.status ?? 1);
 }
 console.log("dist/native/serve-sim-native.node");
+
+// ─── 9. Relocatable compiled distribution ────────────────────────────────
+
+const releaseArch = process.arch === "x64" ? "x86_64" : process.arch;
+const releaseName = `serve-sim-${pkgVersion}-macos-${releaseArch}`;
+const releaseDir = resolve(distDir, releaseName);
+const releaseZip = `${releaseDir}.zip`;
+
+mkdirSync(resolve(releaseDir, "native"), { recursive: true });
+mkdirSync(resolve(releaseDir, "simcam"), { recursive: true });
+mkdirSync(resolve(releaseDir, "simax"), { recursive: true });
+
+copyFileSync(resolve(distDir, "serve-sim"), resolve(releaseDir, "serve-sim"));
+copyFileSync(
+  resolve(distDir, "native", "serve-sim-native.node"),
+  resolve(releaseDir, "native", "serve-sim-native.node"),
+);
+copyFileSync(
+  resolve(distDir, "simcam", "libSimCameraInjector.dylib"),
+  resolve(releaseDir, "simcam", "libSimCameraInjector.dylib"),
+);
+copyFileSync(
+  resolve(distDir, "simcam", "serve-sim-camera-helper"),
+  resolve(releaseDir, "simcam", "serve-sim-camera-helper"),
+);
+copyFileSync(
+  resolve(distDir, "simax", "serve-sim-ax-settings"),
+  resolve(releaseDir, "simax", "serve-sim-ax-settings"),
+);
+copyFileSync(resolve(root, "..", "..", "LICENSE"), resolve(releaseDir, "LICENSE"));
+writeFileSync(
+  resolve(releaseDir, "README.txt"),
+  `serve-sim ${pkgVersion} (${releaseArch})
+
+Run from this directory:
+
+  ./serve-sim
+
+Keep the native, simcam, and simax directories beside the serve-sim
+executable. To make the command available globally, add this directory to
+PATH without moving the executable out of it.
+
+Requires macOS with Xcode and an iOS Simulator runtime installed.
+`,
+);
+
+chmodSync(resolve(releaseDir, "serve-sim"), 0o755);
+chmodSync(resolve(releaseDir, "simcam", "serve-sim-camera-helper"), 0o755);
+chmodSync(resolve(releaseDir, "simax", "serve-sim-ax-settings"), 0o755);
+
+const archive = spawnSync(
+  "ditto",
+  ["-c", "-k", "--keepParent", releaseDir, releaseZip],
+  { stdio: "inherit" },
+);
+if (archive.status !== 0) {
+  console.error("Failed to create compiled distribution archive.");
+  process.exit(archive.status ?? 1);
+}
+console.log(`dist/${releaseName}.zip`);
 
 console.log("Done.");

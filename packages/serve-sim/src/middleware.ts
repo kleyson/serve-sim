@@ -3,7 +3,7 @@ import { execSync, spawn, exec, execFile, type ChildProcess, type ExecException 
 import { tmpdir } from "os";
 import { join } from "path";
 import { createServer as createNetServer } from "net";
-import { createHash, randomBytes, timingSafeEqual } from "crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "crypto";
 import type { IncomingMessage, ServerResponse } from "http";
 import type { Socket } from "net";
 // `ws` (kept external in the build) supplies a WebSocket *client* for the
@@ -115,6 +115,135 @@ const axStreamerCache = createAxStreamerCache();
 // A malformed log entry without a newline can't grow this beyond 1 MB;
 // the partial line is dropped rather than retained indefinitely.
 const SSE_LINE_BUFFER_LIMIT = 1024 * 1024;
+
+// ─── Password auth ────────────────────────────────────────────────────────────
+// When `options.password` is set, requests must carry a valid auth cookie.
+// The cookie value is HMAC(SESSION_SECRET, password) — derived deterministically
+// so the HTTP middleware and the WebSocket upgrade handler agree without
+// sharing a session store, but rotated on every process restart so a leaked
+// cookie does not survive a reboot.
+const AUTH_COOKIE = "serve_sim_auth";
+const SESSION_SECRET = randomBytes(32);
+
+function parseCookies(header: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!header) return out;
+  for (const part of header.split(";")) {
+    const idx = part.indexOf("=");
+    if (idx === -1) continue;
+    const k = part.slice(0, idx).trim();
+    const v = part.slice(idx + 1).trim();
+    if (k) {
+      try { out[k] = decodeURIComponent(v); } catch { out[k] = v; }
+    }
+  }
+  return out;
+}
+
+function expectedAuthToken(password: string): string {
+  return createHmac("sha256", SESSION_SECRET).update("v1:" + password).digest("hex");
+}
+
+function isAuthenticated(req: IncomingMessage, password: string | undefined): boolean {
+  if (!password) return true;
+  const cookie = parseCookies(req.headers.cookie)[AUTH_COOKIE];
+  if (!cookie) return false;
+  return safeEqualString(cookie, expectedAuthToken(password));
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => (
+    c === "&" ? "&amp;" :
+    c === "<" ? "&lt;" :
+    c === ">" ? "&gt;" :
+    c === '"' ? "&quot;" : "&#39;"
+  ));
+}
+
+function renderLoginPage(base: string, error: boolean): string {
+  const action = escapeHtml(base === "" ? "/_auth/login" : base + "/_auth/login");
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>serve-sim — sign in</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; background: #111; color: #eee; height: 100vh; margin: 0; display: grid; place-items: center; }
+  form { background: #1c1c1e; padding: 24px 28px; border-radius: 12px; min-width: 280px; box-shadow: 0 8px 32px rgba(0,0,0,.4); }
+  h1 { font-size: 16px; margin: 0 0 16px; font-weight: 600; }
+  input { width: 100%; padding: 10px 12px; font-size: 14px; background: #2c2c2e; border: 1px solid #3a3a3c; color: #fff; border-radius: 8px; box-sizing: border-box; }
+  input:focus { outline: none; border-color: #0a84ff; }
+  button { width: 100%; margin-top: 12px; padding: 10px; font-size: 14px; background: #0a84ff; color: #fff; border: none; border-radius: 8px; cursor: pointer; }
+  .err { color: #ff453a; font-size: 12px; margin: 8px 0 0; }
+</style>
+</head>
+<body>
+  <form method="POST" action="${action}">
+    <h1>serve-sim</h1>
+    <input name="password" type="password" placeholder="Password" autofocus required autocomplete="current-password" />
+    <button type="submit">Sign in</button>
+    ${error ? '<p class="err">Incorrect password.</p>' : ""}
+  </form>
+</body>
+</html>`;
+}
+
+function buildAuthCookieHeader(token: string, req: IncomingMessage, maxAgeSeconds?: number): string {
+  const parts = [
+    `${AUTH_COOKIE}=${token}`,
+    "HttpOnly",
+    "SameSite=Lax",
+    "Path=/",
+  ];
+  if (httpProtocolForRequest(req) === "https") parts.push("Secure");
+  if (typeof maxAgeSeconds === "number") parts.push(`Max-Age=${maxAgeSeconds}`);
+  return parts.join("; ");
+}
+
+async function handleLoginPost(
+  req: IncomingMessage,
+  res: ServerResponse,
+  password: string,
+  base: string,
+): Promise<void> {
+  try {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const c of req) {
+      const buf = c as Buffer;
+      size += buf.length;
+      if (size > 4096) {
+        res.writeHead(413, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end("Payload too large");
+        return;
+      }
+      chunks.push(buf);
+    }
+    const body = Buffer.concat(chunks).toString("utf8");
+    const params = new URLSearchParams(body);
+    const submitted = params.get("password") ?? "";
+    const ok = safeEqualString(submitted, password);
+    if (!ok) {
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store",
+      });
+      res.end(renderLoginPage(base, true));
+      return;
+    }
+    res.writeHead(302, {
+      Location: base === "" ? "/" : base + "/",
+      "Set-Cookie": buildAuthCookieHeader(expectedAuthToken(password), req, 60 * 60 * 24 * 7),
+      "Cache-Control": "no-store",
+    });
+    res.end();
+  } catch {
+    if (!res.headersSent) res.writeHead(500);
+    res.end();
+  }
+}
+
 let inspectWebKitBridge: Promise<WebKitBridge> | null = null;
 
 function eventLogLimit(rawUrl: string): number | undefined {
@@ -1266,6 +1395,13 @@ export interface SimMiddlewareOptions {
   proxyHelpers?: boolean;
   /** Test hook for supplying a fake inspect-webkit bridge. */
   inspectWebKitBridge?: () => Promise<WebKitBridge>;
+  /**
+   * Optional password gating the entire preview UI. When set, every request
+   * (except the login endpoints) requires a valid `serve_sim_auth` cookie;
+   * unauthenticated browsers get a sign-in page, and other clients get 401.
+   * Intended for use when exposing the preview behind a reverse proxy.
+   */
+  password?: string;
 }
 
 function safeEqualString(a: string, b: string): boolean {
@@ -1300,6 +1436,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
   // can call /exec; cross-origin pages and LAN clients cannot, because they
   // can't read this value (it's only injected into the preview page's config).
   const execToken = options?.execToken ?? randomBytes(32).toString("base64url");
+  const password = options?.password;
 
   // Simulator-settings requests run in-process (just the underlying simctl /
   // ax-tool spawn) instead of round-tripping a full `node <cli>` exec per
@@ -1339,6 +1476,58 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
     const requestedDevice = queryDevice(rawUrl);
     const selectedDevice = requestedDevice ?? options?.device ?? null;
     const devtoolsFrontendBase = base === "/" ? "/devtools-frontend" : `${base}/devtools-frontend`;
+    const method = (req.method ?? "GET").toUpperCase();
+
+    // Login + logout endpoints. These are reachable unauthenticated; everything
+    // else falls through to the auth gate below when `password` is configured.
+    if (password && url === base + "/_auth/login") {
+      if (method === "GET") {
+        if (isAuthenticated(req, password)) {
+          res.writeHead(302, { Location: base === "" ? "/" : base + "/" });
+          res.end();
+          return;
+        }
+        res.writeHead(200, {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "no-store",
+        });
+        res.end(renderLoginPage(base, false));
+        return;
+      }
+      if (method === "POST") {
+        void handleLoginPost(req, res, password, base);
+        return;
+      }
+    }
+    if (password && url === base + "/_auth/logout") {
+      res.writeHead(302, {
+        Location: base === "" ? "/_auth/login" : base + "/_auth/login",
+        "Set-Cookie": `${AUTH_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`,
+        "Cache-Control": "no-store",
+      });
+      res.end();
+      return;
+    }
+
+    // Password gate. Browsers navigating to an HTML page get the login form;
+    // every other client gets a plain 401 so curl/fetch can detect it.
+    if (password && !isAuthenticated(req, password)) {
+      const accept = String(req.headers.accept ?? "");
+      if (method === "GET" && accept.includes("text/html")) {
+        res.writeHead(200, {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "no-store",
+        });
+        res.end(renderLoginPage(base, false));
+        return;
+      }
+      res.writeHead(401, {
+        "Content-Type": "text/plain; charset=utf-8",
+        "WWW-Authenticate": `Cookie name=${AUTH_COOKIE}`,
+      });
+      res.end("Unauthorized");
+      return;
+    }
 
     const helperTarget = helperProxyTarget(rawUrl, helperPrefix);
     if (helperTarget) {
@@ -2127,6 +2316,12 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
   // channel plus same-origin helper/devtools proxy sockets.
   const handleProxyUpgrade = middleware.handleUpgrade;
   middleware.handleUpgrade = (req: SimReq, socket: Socket, head: Buffer) => {
+    // Gate WebSocket upgrades behind the same password as HTTP requests.
+    // Browser sockets carry the auth cookie on the upgrade request.
+    if (password && !isAuthenticated(req, password)) {
+      socket.end("HTTP/1.1 401 Unauthorized\r\n\r\nUnauthorized");
+      return;
+    }
     if (handleExecUpgrade(req, socket, head)) return;
     handleProxyUpgrade(req, socket, head);
   };

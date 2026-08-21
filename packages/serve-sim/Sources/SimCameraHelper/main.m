@@ -929,6 +929,13 @@ int main(int argc, const char *argv[]) {
         while (!gShouldExit) {
             [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];
         }
+        // Reclaim the shm name as soon as we begin shutting down. shm_unlink
+        // only removes the directory entry — the existing mapping stays valid
+        // for this process until exit, so source teardown below can still write
+        // frames. Doing this first guarantees a fresh shm_open(name) by a
+        // watcher returns ENOENT even if a later Stop*/ReleaseSurfaces step
+        // traps before reaching the old unlink at the end of cleanup.
+        if (gShmName) shm_unlink(gShmName);
         if (gAcceptSource) dispatch_source_cancel(gAcceptSource);
         if (gControlListenFd >= 0) { close(gControlListenFd); if (socketPath) unlink(socketPath); }
         // Unlink the shm name before stopping capture sources: if a source

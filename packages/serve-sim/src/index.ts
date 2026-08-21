@@ -8,6 +8,7 @@ import { join, resolve } from "path";
 import { STATE_DIR, stateFileForDevice, listStateFiles, inProcessServeSimState, type ServeSimDeviceState } from "./state";
 import { textToKeyEvents, UnsupportedCharacterError, sendKeyEventsToWs } from "./text-to-keys";
 import { dirnameOf, sleepSync, isPortFree, servePreview } from "./runtime";
+import { isStandaloneBuild, sidecarCandidates } from "./sidecar-paths";
 import { killPortHolder } from "./ports";
 import { findBootedDevice, resolveDevice } from "./device";
 import { permissions } from "./permissions";
@@ -50,11 +51,6 @@ function resolveVersion(): string {
     return "0.0.0";
   }
 }
-
-// Embed the Swift helper so `bun build --compile` produces a self-contained
-// `serve-sim` binary. In dev / the un-compiled ESM bin the returned path is a
-// real file on disk; inside a compiled binary it points at bun's virtual FS
-// and we extract the bytes to a cached location on first use.
 
 type ServerState = ServeSimDeviceState;
 
@@ -347,9 +343,8 @@ async function ensureBooted(udid: string): Promise<void> {
 
 /** Resolve the command to re-exec this CLI (compiled binary or `node …js`). */
 function reExecArgs(extra: string[]): { command: string; args: string[] } {
-  // Compiled standalone binary: argv[0] is the serve-sim binary itself.
-  if (process.argv[0] && /(^|\/)serve-sim$/.test(process.argv[0])) {
-    return { command: process.argv[0], args: extra };
+  if (isStandaloneBuild()) {
+    return { command: process.execPath, args: extra };
   }
   // Running the JS bundle: `node /path/to/serve-sim.js`.
   return { command: process.argv[0]!, args: [process.argv[1]!, ...extra] };
@@ -1007,8 +1002,7 @@ async function memoryWarning(deviceArg?: string) {
  */
 function locateCameraDylib(): string | null {
   const candidates = [
-    join(__dirname, "..", "dist", "simcam", "libSimCameraInjector.dylib"),
-    join(__dirname, "simcam", "libSimCameraInjector.dylib"),
+    ...sidecarCandidates(import.meta.url, ["simcam", "libSimCameraInjector.dylib"]),
     join(__dirname, "..", "Sources", "SimCameraInjector", "build",
          "libSimCameraInjector.dylib"),
   ];
@@ -1034,10 +1028,7 @@ function buildCameraDylib(): string {
 }
 
 function locateCameraHelper(): string | null {
-  const candidates = [
-    join(__dirname, "..", "dist", "simcam", "serve-sim-camera-helper"),
-    join(__dirname, "simcam", "serve-sim-camera-helper"),
-  ];
+  const candidates = sidecarCandidates(import.meta.url, ["simcam", "serve-sim-camera-helper"]);
   for (const p of candidates) if (existsSync(p)) return resolve(p);
   return null;
 }
@@ -1602,6 +1593,7 @@ async function serve(
   codec: string | undefined,
   initialState: PreviewInitialState | undefined,
   theme: SimulatorTheme | undefined,
+  password: string | undefined,
 ) {
   // Boot the target simulators; the preview server streams them in-process
   // (no spawned helper). Sessions are created lazily on the first stream request.
@@ -1624,6 +1616,7 @@ async function serve(
     codec,
     initialState,
     proxyHelpers: true,
+    password,
   });
 
   // Try requested port; if busy and the user didn't pin it, scan forward.
@@ -1749,6 +1742,12 @@ program
       return v;
     },
   )
+  .option(
+    "--password <pw>",
+    "Gate the preview UI behind a sign-in form. Recommended when exposing it " +
+      "publicly (e.g. with --host 0.0.0.0). Falls back to the SERVE_SIM_PASSWORD " +
+      "env var.",
+  )
   .option("-l, --list [device]", "List running streams")
   .option("-k, --kill [device]", "Kill running stream(s)")
   .addHelpText(
@@ -1760,6 +1759,7 @@ Examples:
   serve-sim --codec mjpeg                Force MJPEG (e.g. on VMs without H.264 encode)
   serve-sim --panes devices,tools --fit  Open panes and fit the simulator to the viewport
   serve-sim --theme dark                 Start the simulator in Dark Mode
+  serve-sim --host 0.0.0.0 --password s3cret  Expose on the LAN behind a sign-in form
   serve-sim --no-preview                 Auto-detect booted sim, stream in foreground
   serve-sim --no-preview "iPhone 16 Pro" Stream a specific device (no preview)
   serve-sim --detach                     Start streaming in background (daemon)
@@ -1787,6 +1787,7 @@ Examples:
           ...(opts.panes !== undefined ? { panes: opts.panes } : {}),
           ...(opts.fit ? { fit: true } : {}),
         } : undefined;
+      const password = opts.password ?? process.env.SERVE_SIM_PASSWORD ?? undefined;
       await serve(
         startPort ?? 3200,
         devices,
@@ -1795,6 +1796,7 @@ Examples:
         opts.codec,
         initialState,
         opts.theme,
+        password,
       );
     }
   });

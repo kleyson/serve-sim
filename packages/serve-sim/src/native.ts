@@ -8,9 +8,8 @@
  * compiled binary, and the mounted middleware alike.
  */
 import { createRequire } from "module";
-import { dirname, join } from "path";
 import { existsSync } from "fs";
-import { fileURLToPath } from "url";
+import { sidecarCandidates } from "./sidecar-paths";
 
 const require = createRequire(import.meta.url);
 
@@ -85,16 +84,7 @@ export const Orientation = {
 } as const;
 
 function resolveAddon(): string {
-  const candidates = [
-    // Beside the bun-compiled executable (dist/serve-sim → dist/native/…).
-    // arm64-only (Apple Silicon); loaded by path so it works under npx, the
-    // compiled binary, and the dev server alike.
-    join(dirname(process.execPath), "native", "serve-sim-native.node"),
-    // Beside the bundled JS (dist/serve-sim.js or dist/middleware.js).
-    join(dirname(fileURLToPath(import.meta.url)), "native", "serve-sim-native.node"),
-    // Dev: running from source (src/native.ts → ../dist/native/…).
-    join(dirname(fileURLToPath(import.meta.url)), "..", "dist", "native", "serve-sim-native.node"),
-  ];
+  const candidates = sidecarCandidates(import.meta.url, ["native", "serve-sim-native.node"]);
   for (const p of candidates) {
     if (existsSync(p)) return p;
   }

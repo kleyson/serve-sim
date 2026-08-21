@@ -1,0 +1,94 @@
+name: Build macOS binary bundle
+
+on:
+  push:
+    branches: [lan-proxy-support]
+    tags: ["binary-v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Build binary bundle
+        run: bun run packages/serve-sim/build.ts
+
+      - name: Test
+        run: |
+          # The sim-backed e2e tests skip without a booted simulator, but a few
+          # integration tests can race native cleanup on a loaded runner. Retry
+          # once — a transient wedge clears, a real regression reproduces.
+          run_tests() { bun test --max-concurrency=1 packages/serve-sim/src/__tests__/; }
+          if run_tests; then exit 0; fi
+          echo "::warning title=test retry::first run failed; retrying once"
+          run_tests
+
+      - name: Create checksum
+        run: |
+          archives=(packages/serve-sim/dist/serve-sim-*-macos-*.zip)
+          if [ ! -f "${archives[0]}" ]; then
+            echo "No binary archive was produced."
+            exit 1
+          fi
+          for archive in "${archives[@]}"; do
+            archive_dir=$(dirname "$archive")
+            archive_name=$(basename "$archive")
+            (cd "$archive_dir" && shasum -a 256 "$archive_name" > "$archive_name.sha256")
+          done
+
+      - name: Publish build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/binary-v') }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(packages/serve-sim/dist/serve-sim-*-macos-*.zip \
+                    packages/serve-sim/dist/serve-sim-*-macos-*.zip.sha256)
+          if [ ${#archives[@]} -eq 0 ]; then
+            echo "No archives to upload."
+            exit 1
+          fi
+
+          if [ "$IS_TAG" = "true" ]; then
+            # Permanent release for the binary-v* tag.
+            gh release create "$REF_NAME" "${archives[@]}" \
+              --title "serve-sim $REF_NAME" \
+              --notes "Compiled macOS binary bundle for $REF_NAME." \
+              --target "$SHA"
+            echo "Published permanent release $REF_NAME"
+          else
+            # Rolling prerelease tracking the tip of lan-proxy-support, so every
+            # branch push replaces the download at a stable URL. Deleting the
+            # old release (and its tag) keeps assets from accumulating; it is a
+            # no-op on the first run, hence the `|| true`.
+            TAG="binary-lan-proxy"
+            gh release delete "$TAG" --yes --cleanup-tag || true
+            gh release create "$TAG" "${archives[@]}" \
+              --title "serve-sim (lan-proxy-support latest build)" \
+              --notes "Rolling build from lan-proxy-support @ ${SHA:0:12}. Not a stable release — use a binary-v* tag for that." \
+              --prerelease \
+              --target "$SHA"
+            echo "Published rolling prerelease $TAG"
+          fi

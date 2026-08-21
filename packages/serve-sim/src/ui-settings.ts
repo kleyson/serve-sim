@@ -3,6 +3,7 @@ import { existsSync } from "fs";
 import { join, resolve } from "path";
 import { findBootedDevice, resolveDevice } from "./device";
 import { dirnameOf } from "./runtime";
+import { sidecarCandidates } from "./sidecar-paths";
 
 // Bun's bundler inlines a bare `__dirname` as the build machine's source
 // directory; shadow it with the runtime location so the published bundle
@@ -149,10 +150,7 @@ export function parseUiArgs(args: string[]): UiArgs {
 // ─── In-sim helper binary ───
 
 export function locateAxSettingsTool(): string | null {
-  const candidates = [
-    join(__dirname, "..", "dist", "simax", "serve-sim-ax-settings"),
-    join(__dirname, "simax", "serve-sim-ax-settings"),
-  ];
+  const candidates = sidecarCandidates(import.meta.url, ["simax", "serve-sim-ax-settings"]);
   for (const p of candidates) if (existsSync(p)) return resolve(p);
   return null;
 }

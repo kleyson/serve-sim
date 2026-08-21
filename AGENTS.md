@@ -18,6 +18,43 @@
   `packages/serve-sim/dist/`) rather than `npx serve-sim` or a globally
   installed binary.
 
+## Fork workflow (this is a fork of EvanBacon/serve-sim)
+
+Remotes:
+
+| Remote | URL | Purpose |
+|--------|-----|---------|
+| `origin` | `github.com/kleyson/serve-sim` | the fork — push here |
+| `upstream` | `github.com/EvanBacon/serve-sim` | original — pull updates from here |
+
+Branch layout:
+
+- **`main`** is a clean mirror of `upstream/main`. Never commit feature work
+  directly to it — keep it fast-forwardable so upstream updates stay trivial.
+- **`lan-proxy-support`** carries the local patch set. Personal work lives on
+  branches like this, off the latest upstream. The name is historical: the
+  original LAN/reverse-proxy patch is now upstream (`hostForRequest`,
+  `httpProtocolForRequest`, `x-forwarded-proto`, `rewriteStateForRequestHost`),
+  so the branch only consumes those helpers. What it still adds is optional
+  password auth, the relocatable macOS bundle, and the release workflow.
+
+Pull upstream updates:
+
+```bash
+git checkout main && git fetch upstream && git merge --ff-only upstream/main && git push origin main
+```
+
+Keep a feature branch current:
+
+```bash
+git checkout lan-proxy-support && git fetch upstream && git rebase upstream/main
+```
+
+The remote-viewer overlap that this note used to warn about is resolved:
+upstream's `df53c2a` ("Rewrite helper host to request hostname for remote
+viewers") superseded the branch's own version, and the redundant parts were
+dropped. The branch now rebases onto `upstream/main` cleanly.
+
 ## E2E testing with agent-browser
 
 If you are codex, run in the in-app Codex browser instead of using agent-browser. Only use agent-browser when developing from TUIs like Claude Code.
@@ -58,3 +95,177 @@ Typical camera e2e flow: rebuild, `camera --stop-webcam`, `simctl terminate`
 the app, `camera <bundleId> --file <img> --mirror on` to re-inject, `openurl`
 to load the project, `tap 0.5 0.9` for the shutter, then read the saved JPEG
 off disk to verify (see the path under "agent-browser" above).
+
+# serve-sim Fork Workflow
+
+This repository is a fork of `EvanBacon/serve-sim`.
+
+- `main` must remain a clean, fast-forwardable mirror of `upstream/main`.
+- Custom work and binary releases live on `lan-proxy-support`.
+- Push fork changes to `origin` (`github.com/kleyson/serve-sim`).
+
+## Build The Binary Bundle
+
+Install dependencies and run the unified build from the repository root:
+
+```bash
+bun install --frozen-lockfile
+bun run packages/serve-sim/build.ts
+```
+
+The build creates the JavaScript bundles, compiled CLI, native addon, camera
+components, AX settings helper, and a relocatable zip. The release archive is:
+
+```text
+packages/serve-sim/dist/serve-sim-<version>-macos-<arch>.zip
+```
+
+For example, an Apple Silicon build of version `0.1.34` produces:
+
+```text
+packages/serve-sim/dist/serve-sim-0.1.34-macos-arm64.zip
+```
+
+The zip contains:
+
+```text
+serve-sim-<version>-macos-<arch>/
+  serve-sim
+  native/serve-sim-native.node
+  simcam/libSimCameraInjector.dylib
+  simcam/serve-sim-camera-helper
+  simax/serve-sim-ax-settings
+  LICENSE
+  README.txt
+```
+
+The compiled executable is not independently relocatable. Keep `native`,
+`simcam`, and `simax` beside it. Add the extracted directory to `PATH` instead
+of moving only the executable.
+
+The outer compiled executable uses the build machine's architecture. The native
+sidecars are universal, but producing an Intel archive still requires building
+the outer executable on an x86_64 runner.
+
+## Verify Locally
+
+Run the repository checks after building:
+
+```bash
+bun run typecheck
+bun run lint
+bun test --max-concurrency=1 packages/serve-sim/src/__tests__/
+```
+
+Create and verify a checksum from the archive directory:
+
+```bash
+cd packages/serve-sim/dist
+shasum -a 256 serve-sim-<version>-macos-<arch>.zip > serve-sim-<version>-macos-<arch>.zip.sha256
+shasum -a 256 -c serve-sim-<version>-macos-<arch>.zip.sha256
+```
+
+For a portability smoke test, extract the zip outside the checkout and run:
+
+```bash
+./serve-sim-<version>-macos-<arch>/serve-sim --version
+./serve-sim-<version>-macos-<arch>/serve-sim --help
+./serve-sim-<version>-macos-<arch>/serve-sim camera --list-webcams
+```
+
+## Automatic Branch Builds
+
+The workflow is defined in:
+
+```text
+.github/workflows/build-binary.yml
+```
+
+Every push to `lan-proxy-support` runs the following on a macOS runner:
+
+1. Install dependencies with the frozen lockfile.
+2. Run TypeScript typechecking.
+3. Run linting.
+4. Build the compiled distribution zip.
+5. Run the test directory serially (with a one-shot retry for transient flakes).
+6. Generate a SHA-256 checksum.
+7. Publish the zip and checksum to a rolling GitHub prerelease.
+
+Push the branch normally:
+
+```bash
+git push origin lan-proxy-support
+```
+
+Each push replaces the rolling prerelease tagged `binary-lan-proxy`, so the
+latest build is always at a stable URL:
+
+```text
+https://github.com/kleyson/serve-sim/releases/download/binary-lan-proxy/serve-sim-<version>-macos-<arch>.zip
+```
+
+This is a prerelease — use it for testing the tip of the branch. For a
+permanent download, push a `binary-v*` tag (below).
+
+## Permanent GitHub Releases
+
+Push a tag beginning with `binary-v` to create a permanent GitHub Release:
+
+```bash
+git checkout lan-proxy-support
+git pull --ff-only origin lan-proxy-support
+git tag binary-v0.1.34-kleyson.1
+git push origin binary-v0.1.34-kleyson.1
+```
+
+The same workflow builds and tests the tagged commit, then creates a release and
+uploads both files:
+
+```text
+serve-sim-<version>-macos-<arch>.zip
+serve-sim-<version>-macos-<arch>.zip.sha256
+```
+
+Permanent downloads are published at:
+
+```text
+https://github.com/kleyson/serve-sim/releases
+```
+
+Users can verify a downloaded release from the directory containing both files:
+
+```bash
+shasum -a 256 -c serve-sim-<version>-macos-<arch>.zip.sha256
+```
+
+## Updating From Upstream
+
+Update the clean mirror first:
+
+```bash
+git checkout main
+git fetch upstream
+git merge --ff-only upstream/main
+git push origin main
+```
+
+Then rebase and verify the custom branch:
+
+```bash
+git checkout lan-proxy-support
+git rebase upstream/main
+bun run packages/serve-sim/build.ts
+bun run typecheck
+bun run lint
+bun test --max-concurrency=1 packages/serve-sim/src/__tests__/
+```
+
+After a successful rebase, update the remote branch with lease protection:
+
+```bash
+git push --force-with-lease origin lan-proxy-support
+```
+
+That branch push automatically creates a new temporary Actions artifact. Create
+and push a new `binary-v*` tag only when the commit should become a permanent
+downloadable release.

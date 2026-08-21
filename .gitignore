@@ -9,3 +9,6 @@ dist/
 *.tsbuildinfo
 /packages/serve-sim/.xcode-build
 *.bun-build
+
+# Serena MCP tooling (local only)
+.serena/
