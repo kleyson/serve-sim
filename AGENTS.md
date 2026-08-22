@@ -24,8 +24,23 @@ Remotes:
 
 | Remote | URL | Purpose |
 |--------|-----|---------|
-| `origin` | `github.com/kleyson/serve-sim` | the fork — push here |
+| `origin` | `forgejo.prado.cc/homelab/serve-sim` | the fork, and the source of truth — push here |
+| `github` | `github.com/kleyson/serve-sim` | off-site backup, written by Forgejo's push mirror — do NOT push here by hand |
 | `upstream` | `github.com/EvanBacon/serve-sim` | original — pull updates from here |
+
+⚠ **Push to `origin` (Forgejo), never to `github` directly.** Forgejo push-mirrors
+every ref to `github.com/kleyson/serve-sim` (8h interval, plus on commit). A hand
+push to GitHub makes the mirror's next sync try to *rewind* GitHub back to
+Forgejo's older commits, which is how `forgejo_push_mirror_failing` fired on
+2026-08-21. Keep GitHub strictly downstream and the mirror stays a no-op.
+
+The mirror's GitHub token currently has **no `workflow` scope**, so it cannot
+push changes under `.github/workflows/`. Editing a workflow file will break the
+mirror until that token is re-scoped.
+
+⚠ This repo lives under the **`homelab`** org, not `toor`. It was moved there
+(same `toor/` → `homelab/` migration as `esp32-monitor`). `forgejo.prado.cc/toor/serve-sim`
+returns *"Cannot find repository"* — that means moved, not deleted.
 
 Branch layout:
 
@@ -43,6 +58,20 @@ Pull upstream updates:
 ```bash
 git checkout main && git fetch upstream && git merge --ff-only upstream/main && git push origin main
 ```
+
+⚠ `main` is **push-protected on Forgejo** (`enable_push = false`), so that last
+push is rejected. Open a PR from a temporary branch and merge it with the
+**rebase** method, so `main` lands exactly on the upstream commit with no merge
+commit and stays a pure mirror:
+
+```bash
+git push origin main:sync/upstream-main-<sha>
+# then open a PR sync/upstream-main-<sha> -> main and merge it with `rebase`
+```
+
+Note: `fj pr create` / `fj pr merge` both return **410 Gone** on this repo even
+though pull requests are enabled; the REST API works. Verify `main` actually
+moved afterwards rather than trusting the PR's "Merged" label.
 
 Keep a feature branch current:
 
@@ -102,7 +131,8 @@ This repository is a fork of `EvanBacon/serve-sim`.
 
 - `main` must remain a clean, fast-forwardable mirror of `upstream/main`.
 - Custom work and binary releases live on `lan-proxy-support`.
-- Push fork changes to `origin` (`github.com/kleyson/serve-sim`).
+- Push fork changes to `origin` (`forgejo.prado.cc/homelab/serve-sim`). GitHub is
+  the mirror's output, not a push target — see the remote table above.
 
 ## Build The Binary Bundle
 
@@ -181,7 +211,17 @@ The workflow is defined in:
 .github/workflows/build-binary.yml
 ```
 
-Every push to `lan-proxy-support` runs the following on a macOS runner:
+It runs on **GitHub** Actions, not Forgejo, so it fires when the push mirror
+propagates `lan-proxy-support` to `github.com/kleyson/serve-sim` — not the
+instant you push to `origin`. Expect a lag of up to the mirror interval (8h,
+though `sync_on_commit` usually makes it prompt). To build immediately, trigger
+the mirror:
+
+```bash
+# POST /api/v1/repos/homelab/serve-sim/push_mirrors-sync
+```
+
+Each run does the following on a macOS runner:
 
 1. Install dependencies with the frozen lockfile.
 2. Run TypeScript typechecking.
@@ -191,10 +231,17 @@ Every push to `lan-proxy-support` runs the following on a macOS runner:
 6. Generate a SHA-256 checksum.
 7. Publish the zip and checksum to a rolling GitHub prerelease.
 
-Push the branch normally:
+Push the branch to Forgejo — the mirror carries it to GitHub, which is what
+starts the build:
 
 ```bash
 git push origin lan-proxy-support
+```
+
+After a rebase the branch is rewritten, so it needs a lease-protected force:
+
+```bash
+git push --force-with-lease origin lan-proxy-support
 ```
 
 Each push replaces the rolling prerelease tagged `binary-lan-proxy`, so the
