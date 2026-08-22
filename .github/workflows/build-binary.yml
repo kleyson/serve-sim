@@ -19,6 +19,13 @@ jobs:
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
+        with:
+          # Honour the repo's pin (upstream #133). Without this the action
+          # installs whatever bun is newest, so the job silently drifts version
+          # to version and a failure can never be reproduced against a known
+          # toolchain. Every upstream workflow passes this; this one is ours and
+          # was missed when it was ported over from Forgejo Actions.
+          bun-version-file: .bun-version
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -35,12 +42,40 @@ jobs:
       - name: Test
         run: |
           # The sim-backed e2e tests skip without a booted simulator, but a few
-          # integration tests can race native cleanup on a loaded runner. Retry
-          # once — a transient wedge clears, a real regression reproduces.
+          # integration tests race native cleanup on a loaded runner.
+          #
+          # ⚠ There is a KNOWN upstream flake in here:
+          #   SimCameraHelper shm probe > shutdown unmaps shm so a fresh
+          #   shm_open returns -1 (ENOENT)
+          # It fails as `helper exited with null (expected 0)` — the helper is
+          # killed by a signal instead of exiting 0 during shutdown. Bisected to
+          # upstream `14ad57f` ("Harden helper shutdown and HID log timing"):
+          # its parent `7f109fb` passes 8/8, `14ad57f` fails 2/10 and the tip
+          # 2/8, on pristine checkouts with none of this fork's code. Measured
+          # locally 2026-08-22; the rate is higher on a loaded CI runner.
+          #
+          # THREE attempts, not two. At a ~25% per-run failure rate two attempts
+          # still lose ~6% of the time, which is frequent enough to block a
+          # release for a fault that is not ours. Three puts it near ~1.5%.
+          # A real regression still reproduces on all three.
+          #
+          # Not a simulator reboot between attempts (what upstream's
+          # sim-test.yml does): this flake is in the camera helper's own
+          # shutdown path, not in a wedged simulator, so a reboot would cost
+          # minutes and fix nothing.
           run_tests() { bun test --max-concurrency=1 packages/serve-sim/src/__tests__/; }
-          if run_tests; then exit 0; fi
-          echo "::warning title=test retry::first run failed; retrying once"
-          run_tests
+          for attempt in 1 2 3; do
+            if run_tests; then
+              [ "$attempt" -gt 1 ] && echo "::warning title=test retry::passed on attempt $attempt"
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning title=test retry::attempt $attempt failed; retrying"
+              sleep 5
+            fi
+          done
+          echo "::error title=tests failed::all 3 attempts failed — treat as a real regression"
+          exit 1
 
       - name: Create checksum
         run: |
