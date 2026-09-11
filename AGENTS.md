@@ -24,19 +24,26 @@ Remotes:
 
 | Remote | URL | Purpose |
 |--------|-----|---------|
-| `origin` | `forgejo.prado.cc/homelab/serve-sim` | the fork, and the source of truth — push here |
-| `github` | `github.com/kleyson/serve-sim` | off-site backup, written by Forgejo's push mirror — do NOT push here by hand |
+| `origin` | `forgejo.prado.cc/homelab/serve-sim` | the fork, and the source of truth — push here first |
+| `github` | `github.com/kleyson/serve-sim` | where versions are built — push `lan-proxy-support` (or a `binary-v*` tag) here to publish one |
 | `upstream` | `github.com/EvanBacon/serve-sim` | original — pull updates from here |
 
-⚠ **Push to `origin` (Forgejo), never to `github` directly.** Forgejo push-mirrors
-every ref to `github.com/kleyson/serve-sim` (8h interval, plus on commit). A hand
-push to GitHub makes the mirror's next sync try to *rewind* GitHub back to
-Forgejo's older commits, which is how `forgejo_push_mirror_failing` fired on
-2026-08-21. Keep GitHub strictly downstream and the mirror stays a no-op.
+⚠ **There is no push mirror any more (removed 2026-09-11).** GitHub is updated
+only when a version is published: pushing `lan-proxy-support` or a `binary-v*`
+tag to `github` runs `build-binary.yml` there (see Automatic Branch Builds).
+Everything in between stays on Forgejo.
 
-The mirror's GitHub token currently has **no `workflow` scope**, so it cannot
-push changes under `.github/workflows/`. Editing a workflow file will break the
-mirror until that token is re-scoped.
+It was removed because this repo's workflow files kept breaking it. The homelab's
+mirror token has no `workflow` scope, so GitHub rejected every push that touched
+`.github/workflows/` (`forgejo_push_mirror_failing`, 2026-08-21 and again
+2026-09-11). A push over SSH (`git@github.com:…`) has no such limit.
+
+Publish in this order, the same commit to both:
+
+```bash
+git push origin lan-proxy-support
+git push github lan-proxy-support
+```
 
 ⚠ This repo lives under the **`homelab`** org, not `toor`. It was moved there
 (same `toor/` → `homelab/` migration as `esp32-monitor`). `forgejo.prado.cc/toor/serve-sim`
@@ -211,15 +218,10 @@ The workflow is defined in:
 .github/workflows/build-binary.yml
 ```
 
-It runs on **GitHub** Actions, not Forgejo, so it fires when the push mirror
-propagates `lan-proxy-support` to `github.com/kleyson/serve-sim` — not the
-instant you push to `origin`. Expect a lag of up to the mirror interval (8h,
-though `sync_on_commit` usually makes it prompt). To build immediately, trigger
-the mirror:
-
-```bash
-# POST /api/v1/repos/homelab/serve-sim/push_mirrors-sync
-```
+It runs on **GitHub** Actions, so it fires when `lan-proxy-support` is pushed to
+the `github` remote. Forgejo also sees the workflow, but it needs a macOS
+runner that is rarely online there, so the Forgejo copy of the run is normally
+cancelled — the GitHub run is the one that counts.
 
 Each run does the following on a macOS runner:
 
@@ -227,21 +229,25 @@ Each run does the following on a macOS runner:
 2. Run TypeScript typechecking.
 3. Run linting.
 4. Build the compiled distribution zip.
-5. Run the test directory serially (with a one-shot retry for transient flakes).
+5. Run the test directory serially, up to three attempts for the known upstream
+   flake (`SimCameraHelper shm probe > shutdown unmaps shm`, still present on
+   upstream as of 2026-09-11).
 6. Generate a SHA-256 checksum.
 7. Publish the zip and checksum to a rolling GitHub prerelease.
 
-Push the branch to Forgejo — the mirror carries it to GitHub, which is what
-starts the build:
+Push the branch to Forgejo, then to GitHub — the GitHub push is what starts
+the build:
 
 ```bash
 git push origin lan-proxy-support
+git push github lan-proxy-support
 ```
 
-After a rebase the branch is rewritten, so it needs a lease-protected force:
+After a rebase the branch is rewritten, so both need a lease-protected force:
 
 ```bash
 git push --force-with-lease origin lan-proxy-support
+git push --force-with-lease github lan-proxy-support
 ```
 
 Each push replaces the rolling prerelease tagged `binary-lan-proxy`, so the
@@ -263,7 +269,11 @@ git checkout lan-proxy-support
 git pull --ff-only origin lan-proxy-support
 git tag binary-v0.1.34-kleyson.1
 git push origin binary-v0.1.34-kleyson.1
+git push github lan-proxy-support binary-v0.1.34-kleyson.1
 ```
+
+The tag must reach `github` — that is where the release is built. Push the
+branch with it so GitHub's code matches the release.
 
 The same workflow builds and tests the tagged commit, then creates a release and
 uploads both files:
